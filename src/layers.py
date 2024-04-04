@@ -134,7 +134,7 @@ class SelfAttentionBlock(nn.Module):
         
     def forward(self, x, mask):
         
-        self_attention = lambda x : self.attention(x,x,x, mask)
+        self_attention = lambda x : self.attention(x, mask)
         
         x = self.att_sub(x, self_attention)
         x = self.feedforward_sub(x, self.feedforward)
