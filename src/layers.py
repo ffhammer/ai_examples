@@ -51,6 +51,45 @@ class Attention(nn.Module):
         
         return output
 
+class FasterSelfAttention(nn.Module):
+    
+    def __init__(self, embed_size, num_heads, attn_size, dropout_prob) -> None:
+        super().__init__()
+
+
+        self.qkv_projection = nn.Linear(embed_size, num_heads * attn_size * 3, bias = False)
+        self.output_projection = nn.Linear(num_heads * attn_size, embed_size)
+        self.dropout = nn.Dropout(dropout_prob)
+
+        self.attn_size = torch.tensor(attn_size)
+        self.num_heads = num_heads
+        self.embed_size = embed_size
+
+    def forward(self, qs, mask = None):
+        batch_size = qs.shape[0]
+
+        qs, ks, vs = self.qkv_projection(qs).view(batch_size, qs.shape[1], self.num_heads * 3, self.attn_size).split(self.num_heads, dim = 2)
+
+        attn_product = qs.permute(0,2,1,3) @ ks.permute(0,2,3,1) / torch.sqrt(self.attn_size)
+        
+        if mask is not None:
+            
+            mask = mask.unsqueeze(1).unsqueeze(2) 
+            mask = mask.expand(batch_size, self.num_heads, qs.shape[1], ks.shape[1])  
+
+            attn_product.masked_fill_(mask == 0, -1e9) 
+            
+        scores = nn.functional.softmax(attn_product, -1)
+        
+        scores = self.dropout(scores)
+
+        res = scores @ vs.permute(0,2,1,3)
+        
+        
+        output = self.output_projection(res.transpose(1,2).reshape(batch_size, -1, self.attn_size * self.num_heads))
+        
+        return output
+
 
 class PointwiseFeedForward(nn.Module):
     
@@ -87,7 +126,7 @@ class SelfAttentionBlock(nn.Module):
     def __init__(self, embed_size, num_heads, dropout_prob) -> None:
         super().__init__()
         
-        self.attention = Attention(embed_size, num_heads, int(embed_size/num_heads), int(embed_size/num_heads), dropout_prob)
+        self.attention = FasterSelfAttention(embed_size, num_heads, int(embed_size/num_heads), dropout_prob)
         self.att_sub = SubLayerLogic(embed_size, dropout_prob)
         
         self.feedforward = PointwiseFeedForward(embed_size, dropout_prob)
