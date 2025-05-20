@@ -1,100 +1,89 @@
-from datasets import load_dataset
 import torch
-import pytorch_lightning as pl
-from src.layers import *
-import numpy as np
-from torchvision.transforms import v2
-import matplotlib.pyplot as plt
 from torch import nn
+import pytorch_lightning as pl
+from src.layers import SelfAttentionBlock
 
+
+# modified SmallVit with conv patch embedding
 class SmallVit(nn.Module):
-
     def __init__(
-        self, image_size, patches, num_classes = 1, dim_size=256, n_blocks=4, n_channels=3, num_heads=4,
-    ):
+        self,
+        image_size: int,
+        patches: int,
+        num_classes: int = 10,
+        dim_size: int = 256,
+        n_blocks: int = 4,
+        n_channels: int = 3,
+        num_heads: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
-
         self.image_size = image_size
         self.patches = patches
         self.grid_size = image_size // patches
-        self.n_grids = patches**2
+        self.n_grids = patches * patches
         self.dim_size = dim_size
-        self.n_blocks = n_blocks
-        self.n_channels = n_channels
 
-        assert self.image_size % self.patches == 0
-
-        self._gen_index_blocks()
-
-        self.blocks = nn.ModuleList([SelfAttentionBlock(dim_size, num_heads, 0.05)])
-
-        self.pixel_projection = nn.Linear(
-            self.n_channels * self.grid_size**2, self.dim_size, bias=False
+        # conv-based patch embedding
+        self.conv_proj = nn.Conv2d(
+            n_channels, dim_size, kernel_size=self.grid_size, stride=self.grid_size
         )
 
-        self.class_token = torch.normal(
-            0,
-            0.05,
-            size=(
-                1,
-                dim_size,
-            ),
-            requires_grad=True,
-        )
+        self.class_token = nn.Parameter(torch.zeros(1, 1, dim_size))
+        self.pos_embeddings = nn.Parameter(torch.zeros(1, self.n_grids + 1, dim_size))
 
-        self.pos_embeddings = torch.normal(
-            0, 0.05, size=(self.n_grids + 1, dim_size), requires_grad=True
+        self.blocks = nn.ModuleList(
+            [
+                SelfAttentionBlock(dim_size, num_heads, dropout_prob=dropout)
+                for _ in range(n_blocks)
+            ]
         )
-        
+        self.norm = nn.LayerNorm(dim_size)
         self.head = nn.Linear(dim_size, num_classes)
 
-    def _gen_index_blocks(
-        self,
-    ):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W)
+        B = x.size(0)
+        x = self.conv_proj(x)  # (B, D, p, p)
+        x = x.flatten(2).transpose(1, 2)  # (B, n_grids, D)
+        cls = self.class_token.expand(B, -1, -1)  # (B, 1, D)
+        x = torch.cat([cls, x], dim=1)  # (B, n_grids+1, D)
+        x = x + self.pos_embeddings  # (B, n_grids+1, D)
+        for blk in self.blocks:
+            x = blk(x, mask=None)
+        x = self.norm(x)
+        return self.head(x[:, 0])  # (B, num_classes)
 
-        x_block, y_block = [], []
-        for i in range(self.patches):
-            for j in range(self.patches):
 
-                a = torch.arange(self.image_size)[
-                    i * self.grid_size : (i + 1) * self.grid_size
-                ]
-                b = torch.arange(self.image_size)[
-                    j * self.grid_size : (j + 1) * self.grid_size
-                ]
-                a, b = map(lambda x: x.flatten(), torch.meshgrid(a, b))
-                x_block.append(a)
-                y_block.append(b)
+# Lightning wrapper with loss & accuracy
+class VitLitModel(pl.LightningModule):
+    def __init__(self, model: SmallVit, lr: float = 1e-3) -> None:
+        super().__init__()
+        self.model = model
+        self.loss_fn = nn.CrossEntropyLoss()
+        self.lr = lr
 
-        self.x_index = torch.stack(x_block)
-        self.y_index = torch.stack(y_block)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
 
-    def forward(self, x):
-        """_summary_
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        loss = self.loss_fn(logits, y)
+        preds = logits.argmax(dim=1)
+        acc = (preds == y).float().mean()
+        self.log("train_loss", loss, prog_bar=True)
+        self.log("train_acc", acc, prog_bar=True)
+        return loss
 
-        Args:
-            x (_type_): of shape [bs, n_channels, image_size, image_size]
-        """
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        loss = self.loss_fn(logits, y)
+        preds = logits.argmax(dim=1)
+        acc = (preds == y).float().mean()
+        self.log("val_loss", loss, prog_bar=True)
+        self.log("val_acc", acc, prog_bar=True)
 
-        x = x[:, :, self.x_index, self.y_index]
-        x = x.transpose(2, 1).reshape(
-            -1, self.n_grids, self.n_channels * self.grid_size**2
-        )
-
-        x = self.pixel_projection(x)
-
-        x = torch.cat(
-            (self.class_token.unsqueeze(0).repeat((x.shape[0], 1, 1)), x), axis=1
-        )
-        
-        x += self.pos_embeddings[None, :]
-        
-        for block in self.blocks:
-            
-            x = block(x, None)
-            
-        
-        x = self.head(x[:,0])
-        
-        return x
-        
+    def configure_optimizers(self):
+        return torch.optim.AdamW(self.parameters(), lr=self.lr)
